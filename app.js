@@ -36,7 +36,7 @@ console.log('📍 Native FFmpeg support enabled');
  */
 app.get('/', (req, res) => {
   res.json({
-    service: 'Instagram Frame Extractor',
+    service: 'Instagram Frame Extractor & Audio Compressor',
     status: 'running',
     platform: 'Render.com',
     ffmpeg: 'native',
@@ -44,7 +44,9 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /',
       extractFrames: 'POST /extract-frames',
-      test: 'POST /test'
+      compressAudio: 'POST /compress-audio',
+      test: 'POST /test',
+      testAudio: 'POST /test-audio'
     }
   });
 });
@@ -208,6 +210,152 @@ app.post('/extract-frames', async (req, res) => {
 });
 
 /**
+ * Audio compression endpoint with file size targeting
+ */
+app.post('/compress-audio', async (req, res) => {
+  const startTime = Date.now();
+  const sessionId = uuidv4();
+  let tempFiles = [];
+
+  console.log(`🎵 [${sessionId}] Starting audio compression request`);
+
+  try {
+    // Parse and validate request body
+    const {
+      audioUrl,
+      targetSizeMB = 25,
+      outputFormat = 'mp3',
+      quality = 'medium', // high, medium, low, or specific bitrate like '128k'
+      maxDurationSeconds = null, // Optional: truncate audio if too long
+      normalizeAudio = false // Optional: normalize audio levels
+    } = req.body;
+
+    // Validation
+    if (!audioUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required parameter: audioUrl',
+        sessionId
+      });
+    }
+
+    if (targetSizeMB < 0.1 || targetSizeMB > 500) {
+      return res.status(400).json({
+        success: false,
+        error: 'targetSizeMB must be between 0.1 and 500',
+        sessionId
+      });
+    }
+
+    const supportedFormats = ['mp3', 'aac', 'ogg', 'wav', 'm4a'];
+    if (!supportedFormats.includes(outputFormat.toLowerCase())) {
+      return res.status(400).json({
+        success: false,
+        error: `Unsupported format. Supported: ${supportedFormats.join(', ')}`,
+        sessionId
+      });
+    }
+
+    console.log(`📥 [${sessionId}] Processing: ${audioUrl}`);
+    console.log(`⚙️ [${sessionId}] Target: ${targetSizeMB}MB, Format: ${outputFormat}, Quality: ${quality}`);
+
+    // Step 1: Download audio file
+    const inputPath = path.join('/tmp', `audio_input_${sessionId}.tmp`);
+    const outputPath = path.join('/tmp', `audio_output_${sessionId}.${outputFormat}`);
+    tempFiles.push(inputPath, outputPath);
+
+    console.log(`⬇️ [${sessionId}] Downloading audio...`);
+    await downloadVideo(audioUrl, inputPath); // Reuse download function
+    console.log(`✅ [${sessionId}] Audio downloaded successfully`);
+
+    // Step 2: Get audio metadata
+    console.log(`🔍 [${sessionId}] Analyzing audio metadata...`);
+    const audioMetadata = await getAudioMetadata(inputPath);
+    console.log(`📊 [${sessionId}] Audio: ${audioMetadata.duration}s, ${audioMetadata.bitrate} kbps, ${audioMetadata.channels} channels`);
+
+    // Step 3: Calculate optimal compression settings
+    const targetSizeBytes = targetSizeMB * 1024 * 1024;
+    const duration = parseFloat(audioMetadata.duration);
+    
+    // Apply max duration if specified
+    const actualDuration = maxDurationSeconds ? Math.min(duration, maxDurationSeconds) : duration;
+    
+    const compressionSettings = calculateAudioCompressionSettings(
+      targetSizeBytes, 
+      actualDuration, 
+      outputFormat, 
+      quality
+    );
+
+    console.log(`🧮 [${sessionId}] Compression settings: ${compressionSettings.bitrate} bitrate, ${compressionSettings.codec} codec`);
+
+    // Step 4: Compress audio
+    console.log(`🗜️ [${sessionId}] Starting audio compression...`);
+    await compressAudio(inputPath, outputPath, compressionSettings, actualDuration, normalizeAudio, targetSizeBytes);
+    
+    // Step 5: Get final file info
+    const finalStats = await fs.stat(outputPath);
+    const finalSizeMB = Math.round((finalStats.size / (1024 * 1024)) * 100) / 100;
+    const compressionRatio = Math.round((finalStats.size / (await fs.stat(inputPath)).size) * 100);
+
+    console.log(`✅ [${sessionId}] Compression complete: ${finalSizeMB}MB (${compressionRatio}% of original)`);
+
+    // Step 6: Read compressed file as base64
+    const compressedBuffer = await fs.readFile(outputPath);
+    const base64Audio = compressedBuffer.toString('base64');
+    const mimeType = getMimeType(outputFormat);
+
+    // Step 7: Return results
+    const processingTime = Date.now() - startTime;
+
+    const response = {
+      success: true,
+      audio: {
+        base64: `data:${mimeType};base64,${base64Audio}`,
+        format: outputFormat,
+        sizeMB: finalSizeMB,
+        sizeBytes: finalStats.size,
+        duration: actualDuration,
+        bitrate: compressionSettings.bitrate,
+        compressionRatio: compressionRatio
+      },
+      metadata: {
+        sessionId: sessionId,
+        originalDuration: duration,
+        originalBitrate: audioMetadata.bitrate,
+        originalChannels: audioMetadata.channels,
+        targetSizeMB: targetSizeMB,
+        actualSizeMB: finalSizeMB,
+        processingTimeMs: processingTime,
+        processedAt: new Date().toISOString(),
+        settings: compressionSettings,
+        truncated: maxDurationSeconds && duration > maxDurationSeconds,
+        platform: 'render',
+        ffmpegVersion: '4.1.11'
+      }
+    };
+
+    res.status(200).json(response);
+
+  } catch (error) {
+    const processingTime = Date.now() - startTime;
+    console.error(`💥 [${sessionId}] Audio compression failed:`, error);
+
+    res.status(500).json({
+      success: false,
+      error: 'Audio compression failed',
+      details: error.message,
+      sessionId: sessionId,
+      processingTimeMs: processingTime,
+      timestamp: new Date().toISOString()
+    });
+  } finally {
+    // Cleanup temporary files
+    await cleanupFiles(tempFiles, sessionId);
+  }
+});
+
+/**
  * Test endpoint with sample video
  */
 app.post('/test', async (req, res) => {
@@ -226,6 +374,24 @@ app.post('/test', async (req, res) => {
   // Forward to main extraction endpoint
   req.body = testRequest;
   return app._router.handle({ ...req, method: 'POST', url: '/extract-frames' }, res);
+});
+
+/**
+ * Test audio compression endpoint
+ */
+app.post('/test-audio', async (req, res) => {
+  console.log('🧪 Audio test endpoint called');
+  
+  const testRequest = {
+    audioUrl: 'https://sample-videos.com/zip/10/mp3/mp3-sample.mp3',
+    targetSizeMB: 5,
+    outputFormat: 'mp3',
+    quality: 'medium'
+  };
+  
+  // Forward to audio compression endpoint
+  req.body = testRequest;
+  return app._router.handle({ ...req, method: 'POST', url: '/compress-audio' }, res);
 });
 
 /**
@@ -291,6 +457,187 @@ function getVideoMetadata(videoPath) {
       });
     });
   });
+}
+
+/**
+ * Get audio metadata using FFprobe
+ */
+function getAudioMetadata(audioPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(audioPath, (err, metadata) => {
+      if (err) {
+        reject(new Error(`FFprobe failed: ${err.message}`));
+        return;
+      }
+
+      const audioStream = metadata.streams.find(stream => stream.codec_type === 'audio');
+      if (!audioStream) {
+        reject(new Error('No audio stream found in file'));
+        return;
+      }
+
+      resolve({
+        duration: metadata.format.duration,
+        bitrate: Math.round(parseInt(metadata.format.bit_rate || audioStream.bit_rate || 128000) / 1000),
+        sampleRate: audioStream.sample_rate || 44100,
+        channels: audioStream.channels || 2,
+        codec: audioStream.codec_name,
+        format: metadata.format.format_name
+      });
+    });
+  });
+}
+
+/**
+ * Calculate optimal compression settings based on target size
+ */
+function calculateAudioCompressionSettings(targetSizeBytes, durationSeconds, outputFormat, quality) {
+  // Calculate target bitrate: (target_size_bits / duration) with safety margin
+  const targetSizeBits = targetSizeBytes * 8;
+  const safetyMargin = 0.9; // Use 90% of target to account for container overhead
+  const maxBitrate = Math.floor((targetSizeBits * safetyMargin) / durationSeconds / 1000); // kbps
+
+  let codec, bitrate, preset;
+
+  // Set codec based on format
+  switch (outputFormat.toLowerCase()) {
+    case 'mp3':
+      codec = 'libmp3lame';
+      break;
+    case 'aac':
+    case 'm4a':
+      codec = 'aac';
+      break;
+    case 'ogg':
+      codec = 'libvorbis';
+      break;
+    case 'wav':
+      codec = 'pcm_s16le';
+      break;
+    default:
+      codec = 'libmp3lame';
+  }
+
+  // Set bitrate based on quality setting
+  if (typeof quality === 'string' && quality.includes('k')) {
+    // Specific bitrate provided (e.g., "128k")
+    bitrate = Math.min(parseInt(quality), maxBitrate);
+  } else {
+    // Quality presets
+    const qualityPresets = {
+      'high': Math.min(320, maxBitrate),
+      'medium': Math.min(192, maxBitrate), 
+      'low': Math.min(128, maxBitrate)
+    };
+    bitrate = qualityPresets[quality] || qualityPresets['medium'];
+  }
+
+  // Ensure minimum bitrate for quality
+  const minBitrates = { mp3: 64, aac: 64, ogg: 64, wav: 256 };
+  const minBitrate = minBitrates[outputFormat] || 64;
+  bitrate = Math.max(bitrate, minBitrate);
+
+  // Final check against target size
+  if (bitrate > maxBitrate) {
+    console.warn(`Calculated bitrate ${bitrate}k exceeds target size, using ${maxBitrate}k`);
+    bitrate = maxBitrate;
+  }
+
+  return {
+    codec,
+    bitrate: `${bitrate}k`,
+    preset: codec === 'libmp3lame' ? 'standard' : 'medium'
+  };
+}
+
+/**
+ * Compress audio file using FFmpeg
+ */
+function compressAudio(inputPath, outputPath, settings, maxDuration, normalize, targetSizeBytes) {
+  return new Promise((resolve, reject) => {
+    let command = ffmpeg(inputPath);
+
+    // Apply audio filters if needed
+    const filters = [];
+    if (normalize) {
+      filters.push('loudnorm=I=-16:LRA=11:TP=-1.5'); // EBU R128 normalization
+    }
+
+    if (filters.length > 0) {
+      command = command.audioFilters(filters);
+    }
+
+    // Set duration limit if specified
+    if (maxDuration) {
+      command = command.duration(maxDuration);
+    }
+
+    // Configure audio encoding
+    command = command
+      .audioCodec(settings.codec)
+      .audioBitrate(settings.bitrate)
+      .audioChannels(2) // Stereo output
+      .audioFrequency(44100) // Standard sample rate
+      .format(getFormatFromCodec(settings.codec));
+
+    // Add file size limit
+    const targetSizeMB = Math.ceil(targetSizeBytes / (1024 * 1024));
+    command = command.outputOptions(['-fs', `${targetSizeMB}M`]);
+
+    // Add quality options for specific codecs
+    if (settings.codec === 'libmp3lame') {
+      command = command.outputOptions(['-q:a', '2']); // High quality VBR
+    } else if (settings.codec === 'aac') {
+      command = command.outputOptions(['-profile:a', 'aac_low']);
+    } else if (settings.codec === 'libvorbis') {
+      command = command.outputOptions(['-q:a', '6']); // Ogg quality level
+    }
+
+    command
+      .output(outputPath)
+      .on('start', (commandLine) => {
+        console.log(`🔧 FFmpeg command: ${commandLine}`);
+      })
+      .on('progress', (progress) => {
+        if (progress.percent) {
+          console.log(`🗜️ Processing: ${Math.round(progress.percent)}%`);
+        }
+      })
+      .on('end', () => {
+        resolve();
+      })
+      .on('error', (err) => {
+        reject(new Error(`Audio compression failed: ${err.message}`));
+      })
+      .run();
+  });
+}
+
+/**
+ * Get MIME type for audio format
+ */
+function getMimeType(format) {
+  const mimeTypes = {
+    'mp3': 'audio/mpeg',
+    'aac': 'audio/aac',
+    'm4a': 'audio/mp4',
+    'ogg': 'audio/ogg',
+    'wav': 'audio/wav'
+  };
+  return mimeTypes[format.toLowerCase()] || 'audio/mpeg';
+}
+
+/**
+ * Get format string for FFmpeg based on codec
+ */
+function getFormatFromCodec(codec) {
+  const formats = {
+    'libmp3lame': 'mp3',
+    'aac': 'adts',
+    'libvorbis': 'ogg',
+    'pcm_s16le': 'wav'
+  };
+  return formats[codec] || 'mp3';
 }
 
 /**
@@ -370,7 +717,7 @@ app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/extract-frames', '/test'],
+    availableEndpoints: ['/', '/health', '/extract-frames', '/compress-audio', '/test', '/test-audio'],
     method: req.method,
     path: req.originalUrl
   });
@@ -380,10 +727,12 @@ app.use('*', (req, res) => {
  * Start server
  */
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Instagram Frame Extractor running on port ${PORT}`);
+  console.log(`🚀 Instagram Frame Extractor & Audio Compressor running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
   console.log(`🎬 Extract frames: POST http://localhost:${PORT}/extract-frames`);
-  console.log(`🧪 Test endpoint: POST http://localhost:${PORT}/test`);
+  console.log(`🎵 Compress audio: POST http://localhost:${PORT}/compress-audio`);
+  console.log(`🧪 Test video: POST http://localhost:${PORT}/test`);
+  console.log(`🧪 Test audio: POST http://localhost:${PORT}/test-audio`);
   console.log(`⚙️ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
