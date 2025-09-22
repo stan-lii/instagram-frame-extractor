@@ -1,0 +1,56 @@
+# Render Blueprint for Instagram Frame Extractor
+# This file allows Infrastructure as Code deployment to Render
+
+services:
+  - type: web
+    name: instagram-frame-extractor
+    runtime: node
+    plan: starter  # Can be: free, starter, standard, pro, pro plus
+    region: oregon  # Can be: oregon, ohio, singapore, frankfurt
+    
+    # Build settings
+    buildCommand: npm install
+    startCommand: node app.js
+    
+    # Repository settings
+    repo: https://github.com/your-username/render-frame-extractor.git
+    branch: main
+    
+    # Environment variables
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    
+    # Health check
+    healthCheckPath: /health
+    
+    # Auto-deploy settings
+    autoDeploy: true
+    
+    # Instance settings
+    numInstances: 1
+    
+    # Scaling (for paid plans)
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+      targetMemoryPercent: 80
+      targetCPUPercent: 80
+
+# Optional: Add environment-specific overrides
+environments:
+  - name: production
+    services:
+      - name: instagram-frame-extractor
+        plan: starter
+        scaling:
+          minInstances: 1
+          maxInstances: 5
+
+  - name: development  
+    services:
+      - name: instagram-frame-extractor-dev
+        plan: free
+        branch: development
