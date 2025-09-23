@@ -656,8 +656,13 @@ function compressAudio(inputPath, outputPath, settings, maxDuration, normalize, 
   return new Promise((resolve, reject) => {
     let command = ffmpeg(inputPath);
 
-    // Apply audio filters if needed
+    // Apply audio filters to prevent clipping and preserve audio start/end
     const filters = [];
+    
+    // Add padding at the beginning and end to prevent clipping
+    filters.push('apad=pad_dur=0.1'); // Add 0.1 second padding at end
+    filters.push('adelay=100'); // Add 100ms delay at start (prevents clipping)
+    
     if (normalize) {
       filters.push('loudnorm=I=-16:LRA=11:TP=-1.5'); // EBU R128 normalization
     }
@@ -666,9 +671,9 @@ function compressAudio(inputPath, outputPath, settings, maxDuration, normalize, 
       command = command.audioFilters(filters);
     }
 
-    // Set duration limit if specified
+    // Set duration limit if specified (account for added padding)
     if (maxDuration) {
-      command = command.duration(maxDuration);
+      command = command.duration(maxDuration + 0.2); // Add extra time for padding
     }
 
     // Configure audio encoding
@@ -683,11 +688,24 @@ function compressAudio(inputPath, outputPath, settings, maxDuration, normalize, 
     const targetSizeMB = Math.ceil(targetSizeBytes / (1024 * 1024));
     command = command.outputOptions(['-fs', `${targetSizeMB}M`]);
 
+    // Prevent audio trimming and preserve timing
+    command = command.outputOptions([
+      '-avoid_negative_ts', 'make_zero', // Prevent negative timestamps
+      '-fflags', '+genpts' // Generate presentation timestamps
+    ]);
+
     // Add quality options for specific codecs
     if (settings.codec === 'libmp3lame') {
-      command = command.outputOptions(['-q:a', '2']); // High quality VBR
+      command = command.outputOptions([
+        '-q:a', '2', // High quality VBR
+        '-joint_stereo', '0', // Disable joint stereo (can cause timing issues)
+        '-reservoir', '0' // Disable bit reservoir (can cause delays)
+      ]);
     } else if (settings.codec === 'aac') {
-      command = command.outputOptions(['-profile:a', 'aac_low']);
+      command = command.outputOptions([
+        '-profile:a', 'aac_low',
+        '-movflags', '+faststart' // Optimize for streaming
+      ]);
     } else if (settings.codec === 'libvorbis') {
       command = command.outputOptions(['-q:a', '6']); // Ogg quality level
     }
