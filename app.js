@@ -45,6 +45,7 @@ app.get('/', (req, res) => {
       health: 'GET /',
       extractFrames: 'POST /extract-frames',
       compressAudio: 'POST /compress-audio',
+      download: 'GET /download/:filename',
       test: 'POST /test',
       testAudio: 'POST /test-audio'
     }
@@ -59,6 +60,23 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// Initialize global temp files storage
+global.tempFiles = global.tempFiles || {};
+
+// Cleanup old temp files every hour
+setInterval(() => {
+  if (global.tempFiles) {
+    const now = Date.now();
+    Object.keys(global.tempFiles).forEach(sessionId => {
+      const fileInfo = global.tempFiles[sessionId];
+      if (now - fileInfo.createdAt > 60 * 60 * 1000) { // 1 hour
+        fs.unlink(fileInfo.path).catch(() => {}); // Ignore errors
+        delete global.tempFiles[sessionId];
+      }
+    });
+  }
+}, 60 * 60 * 1000); // Run every hour
 
 /**
  * Main frame extraction endpoint
@@ -305,7 +323,20 @@ app.post('/compress-audio', async (req, res) => {
     const base64Audio = compressedBuffer.toString('base64');
     const mimeType = getMimeType(outputFormat);
 
-    // Step 7: Return results
+    // Step 7: Create temporary download URL (for direct file access)
+    const tempDownloadPath = path.join('/tmp', `download_${sessionId}.${outputFormat}`);
+    await fs.copyFile(outputPath, tempDownloadPath);
+    
+    // Store file info for download endpoint
+    global.tempFiles = global.tempFiles || {};
+    global.tempFiles[sessionId] = {
+      path: tempDownloadPath,
+      format: outputFormat,
+      mimeType: mimeType,
+      createdAt: Date.now()
+    };
+
+    // Step 8: Return results
     const processingTime = Date.now() - startTime;
 
     const response = {
@@ -317,7 +348,8 @@ app.post('/compress-audio', async (req, res) => {
         sizeBytes: finalStats.size,
         duration: actualDuration,
         bitrate: compressionSettings.bitrate,
-        compressionRatio: compressionRatio
+        compressionRatio: compressionRatio,
+        downloadUrl: `https://${req.get('host') || 'localhost'}/download/${sessionId}.${outputFormat}`
       },
       metadata: {
         sessionId: sessionId,
@@ -374,6 +406,73 @@ app.post('/test', async (req, res) => {
   // Forward to main extraction endpoint
   req.body = testRequest;
   return app._router.handle({ ...req, method: 'POST', url: '/extract-frames' }, res);
+});
+
+/**
+ * Download compressed file endpoint (for OpenAI Whisper compatibility)
+ */
+app.get('/download/:filename', async (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const sessionId = filename.split('.')[0];
+    
+    // Check if file exists in temp storage
+    if (!global.tempFiles || !global.tempFiles[sessionId]) {
+      return res.status(404).json({
+        success: false,
+        error: 'File not found or expired'
+      });
+    }
+    
+    const fileInfo = global.tempFiles[sessionId];
+    
+    // Check if file is older than 1 hour (cleanup old files)
+    if (Date.now() - fileInfo.createdAt > 60 * 60 * 1000) {
+      delete global.tempFiles[sessionId];
+      return res.status(410).json({
+        success: false,
+        error: 'File expired'
+      });
+    }
+    
+    // Check if file exists on disk
+    try {
+      await fs.access(fileInfo.path);
+    } catch {
+      delete global.tempFiles[sessionId];
+      return res.status(404).json({
+        success: false,
+        error: 'File not found'
+      });
+    }
+    
+    // Set proper headers for audio download
+    res.setHeader('Content-Type', fileInfo.mimeType);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Cache-Control', 'no-cache');
+    
+    // Stream the file
+    const fileStream = require('fs').createReadStream(fileInfo.path);
+    fileStream.pipe(res);
+    
+    // Clean up file info after download
+    fileStream.on('end', () => {
+      setTimeout(() => {
+        if (global.tempFiles && global.tempFiles[sessionId]) {
+          fs.unlink(fileInfo.path).catch(() => {}); // Ignore cleanup errors
+          delete global.tempFiles[sessionId];
+        }
+      }, 5000); // Give 5 seconds for any additional downloads
+    });
+    
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Download failed',
+      details: error.message
+    });
+  }
 });
 
 /**
@@ -717,7 +816,7 @@ app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
     error: 'Endpoint not found',
-    availableEndpoints: ['/', '/health', '/extract-frames', '/compress-audio', '/test', '/test-audio'],
+    availableEndpoints: ['/', '/health', '/extract-frames', '/compress-audio', '/download/:filename', '/test', '/test-audio'],
     method: req.method,
     path: req.originalUrl
   });
@@ -731,6 +830,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📍 Health check: http://localhost:${PORT}/health`);
   console.log(`🎬 Extract frames: POST http://localhost:${PORT}/extract-frames`);
   console.log(`🎵 Compress audio: POST http://localhost:${PORT}/compress-audio`);
+  console.log(`📥 Download files: GET http://localhost:${PORT}/download/:filename`);
   console.log(`🧪 Test video: POST http://localhost:${PORT}/test`);
   console.log(`🧪 Test audio: POST http://localhost:${PORT}/test-audio`);
   console.log(`⚙️ Environment: ${process.env.NODE_ENV || 'development'}`);
